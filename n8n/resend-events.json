@@ -1,0 +1,262 @@
+{
+  "name": "Resend: webhook events and suppression list",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "resend-events",
+        "responseMode": "responseNode",
+        "options": {
+          "rawBody": true
+        }
+      },
+      "name": "Resend events",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        0
+      ],
+      "id": "n-resend-events",
+      "webhookId": "resend-events"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "language": "javaScript",
+        "jsCode": "// Pure helpers shared by the n8n Code nodes. No n8n globals, no network.\n// The build script (scripts/build_n8n.py) pastes this file into each Code\n// node, followed by that node's glue code. The tests run it with Node.\n\nconst crypto = require('crypto');\n\nconst TOLERANCE_SECONDS = 5 * 60;\nconst SUPPRESS_ON = {\n  'email.bounced': 'bounced',\n  'email.complained': 'complained',\n  'email.suppressed': 'suppressed_by_resend',\n};\n\n// Same scheme as the Python package: \"<scope>/<sha256(scope \\x1f event_id)>\".\n// So the Python sender and the n8n sender agree on the key for one event.\nfunction idempotencyKey(eventId, scope) {\n  scope = scope || 'email';\n  if (eventId === undefined || eventId === null || !String(eventId).trim()) {\n    throw new Error('event_id is required for an idempotency key');\n  }\n  const digest = crypto.createHash('sha256').update(`${scope}\\x1f${eventId}`, 'utf8').digest('hex');\n  const safeScope = scope.replace(/[^A-Za-z0-9_.-]+/g, '-').slice(0, 64) || 'email';\n  return `${safeScope}/${digest}`;\n}\n\nfunction normalise(address) {\n  let a = String(address || '').trim();\n  const lt = a.lastIndexOf('<');\n  if (lt !== -1 && a.endsWith('>')) a = a.slice(lt + 1, -1);\n  return a.trim().toLowerCase();\n}\n\n// Validate an incoming send request and build the Resend payload.\nfunction buildEmail(input, defaults) {\n  const errors = [];\n  const to = Array.isArray(input.to) ? input.to : input.to ? [input.to] : [];\n  if (!input.event_id) errors.push('event_id is required');\n  if (!to.length) errors.push('to is required');\n  if (to.length > 50) errors.push('to has more than 50 recipients');\n  if (!input.subject) errors.push('subject is required');\n  if (!input.html && !input.text) errors.push('html or text is required');\n  const from = input.from || defaults.from;\n  if (!from) errors.push('from is required (set it in Config)');\n  if (errors.length) return { ok: false, errors };\n  const payload = {\n    from,\n    to,\n    subject: String(input.subject).replace(/\\s+/g, ' ').trim(),\n  };\n  if (input.html) payload.html = input.html;\n  if (input.text) payload.text = input.text;\n  if (input.reply_to || defaults.reply_to) payload.reply_to = input.reply_to || defaults.reply_to;\n  if (input.tags && typeof input.tags === 'object') {\n    payload.tags = Object.entries(input.tags).map(([name, value]) => ({ name, value: String(value) }));\n  }\n  const scope = input.scope || 'n8n-email';\n  return { ok: true, payload, idempotencyKey: idempotencyKey(input.event_id, scope), to: to.map(normalise) };\n}\n\nfunction getHeader(headers, name) {\n  const lower = {};\n  for (const [k, v] of Object.entries(headers || {})) lower[k.toLowerCase()] = v;\n  return lower[`svix-${name}`] || lower[`webhook-${name}`];\n}\n\n// Svix verification, as documented for Resend webhooks.\n// rawBody must be the exact bytes received (a Buffer or a string).\nfunction verifySvix(rawBody, headers, secret, nowSeconds) {\n  const fail = (reason) => ({ valid: false, reason });\n  const id = getHeader(headers, 'id');\n  const ts = getHeader(headers, 'timestamp');\n  const sigs = getHeader(headers, 'signature');\n  if (!id || !ts || !sigs) return fail('missing svix headers');\n  if (!/^\\d+$/.test(String(ts))) return fail('bad timestamp');\n  const now = nowSeconds === undefined ? Math.floor(Date.now() / 1000) : nowSeconds;\n  if (Math.abs(now - Number(ts)) > TOLERANCE_SECONDS) return fail('timestamp outside the allowed window');\n  if (!secret) return fail('webhook secret is not configured');\n  const secretBytes = Buffer.from(secret.startsWith('whsec_') ? secret.slice(6) : secret, 'base64');\n  const body = Buffer.isBuffer(rawBody) ? rawBody : Buffer.from(String(rawBody), 'utf8');\n  const signed = Buffer.concat([Buffer.from(`${id}.${ts}.`, 'utf8'), body]);\n  const expected = Buffer.from(crypto.createHmac('sha256', secretBytes).update(signed).digest('base64'));\n  let matched = false;\n  for (const entry of String(sigs).split(' ')) {\n    const comma = entry.indexOf(',');\n    if (comma === -1 || entry.slice(0, comma) !== 'v1') continue;\n    const given = Buffer.from(entry.slice(comma + 1));\n    if (given.length === expected.length && crypto.timingSafeEqual(given, expected)) {\n      matched = true;\n      break;\n    }\n  }\n  if (!matched) return fail('no matching signature');\n  let event;\n  try {\n    event = JSON.parse(body.toString('utf8'));\n  } catch (e) {\n    return fail('body is not valid JSON');\n  }\n  return { valid: true, svixId: id, event };\n}\n\nfunction suppressionReason(event) {\n  const reason = SUPPRESS_ON[event && event.type];\n  if (!reason) return null;\n  if (event.type === 'email.bounced') {\n    const bounce = (event.data && event.data.bounce) || {};\n    if (String(bounce.type || '').toLowerCase() === 'transient') return null;\n  }\n  return reason;\n}\n\n// Apply a verified event to a store shaped like n8n static data:\n// { suppressed: { email: {reason, svixId, at} }, seen: [svixId, ...] }\nfunction applyEvent(store, svixId, event, nowIso) {\n  store.suppressed = store.suppressed || {};\n  store.seen = store.seen || [];\n  if (store.seen.includes(svixId)) return { type: event.type, duplicate: true, suppressed: [] };\n  store.seen.push(svixId);\n  if (store.seen.length > 1000) store.seen.splice(0, store.seen.length - 1000);\n  const added = [];\n  const reason = suppressionReason(event);\n  if (reason) {\n    const to = (event.data && event.data.to) || [];\n    for (const addr of Array.isArray(to) ? to : [to]) {\n      const key = normalise(addr);\n      if (key && !store.suppressed[key]) {\n        store.suppressed[key] = { reason, svixId, at: nowIso || new Date().toISOString() };\n        added.push(key);\n      }\n    }\n  }\n  return { type: event.type, duplicate: false, suppressed: added };\n}\n\nif (typeof module !== 'undefined') {\n  module.exports = { idempotencyKey, normalise, buildEmail, verifySvix, suppressionReason, applyEvent };\n}\n\n// ---- n8n glue ----\n// The raw body is needed: re-serialised JSON can differ from what was signed.\nlet raw;\nif ($input.item.binary && $input.item.binary.data) {\n  raw = await this.helpers.getBinaryDataBuffer($itemIndex, 'data');\n} else {\n  raw = JSON.stringify($json.body); // fallback; see README\n}\nconst secret = $env.RESEND_WEBHOOK_SECRET;\nreturn { json: verifySvix(raw, $json.headers, secret) };\n"
+      },
+      "name": "Verify Svix signature",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        220,
+        0
+      ],
+      "id": "n-verify-svix-signature"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "id": "c1",
+              "leftValue": "={{ $json.valid }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "name": "Signature valid?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        440,
+        0
+      ],
+      "id": "n-signature-valid?"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "language": "javaScript",
+        "jsCode": "// Pure helpers shared by the n8n Code nodes. No n8n globals, no network.\n// The build script (scripts/build_n8n.py) pastes this file into each Code\n// node, followed by that node's glue code. The tests run it with Node.\n\nconst crypto = require('crypto');\n\nconst TOLERANCE_SECONDS = 5 * 60;\nconst SUPPRESS_ON = {\n  'email.bounced': 'bounced',\n  'email.complained': 'complained',\n  'email.suppressed': 'suppressed_by_resend',\n};\n\n// Same scheme as the Python package: \"<scope>/<sha256(scope \\x1f event_id)>\".\n// So the Python sender and the n8n sender agree on the key for one event.\nfunction idempotencyKey(eventId, scope) {\n  scope = scope || 'email';\n  if (eventId === undefined || eventId === null || !String(eventId).trim()) {\n    throw new Error('event_id is required for an idempotency key');\n  }\n  const digest = crypto.createHash('sha256').update(`${scope}\\x1f${eventId}`, 'utf8').digest('hex');\n  const safeScope = scope.replace(/[^A-Za-z0-9_.-]+/g, '-').slice(0, 64) || 'email';\n  return `${safeScope}/${digest}`;\n}\n\nfunction normalise(address) {\n  let a = String(address || '').trim();\n  const lt = a.lastIndexOf('<');\n  if (lt !== -1 && a.endsWith('>')) a = a.slice(lt + 1, -1);\n  return a.trim().toLowerCase();\n}\n\n// Validate an incoming send request and build the Resend payload.\nfunction buildEmail(input, defaults) {\n  const errors = [];\n  const to = Array.isArray(input.to) ? input.to : input.to ? [input.to] : [];\n  if (!input.event_id) errors.push('event_id is required');\n  if (!to.length) errors.push('to is required');\n  if (to.length > 50) errors.push('to has more than 50 recipients');\n  if (!input.subject) errors.push('subject is required');\n  if (!input.html && !input.text) errors.push('html or text is required');\n  const from = input.from || defaults.from;\n  if (!from) errors.push('from is required (set it in Config)');\n  if (errors.length) return { ok: false, errors };\n  const payload = {\n    from,\n    to,\n    subject: String(input.subject).replace(/\\s+/g, ' ').trim(),\n  };\n  if (input.html) payload.html = input.html;\n  if (input.text) payload.text = input.text;\n  if (input.reply_to || defaults.reply_to) payload.reply_to = input.reply_to || defaults.reply_to;\n  if (input.tags && typeof input.tags === 'object') {\n    payload.tags = Object.entries(input.tags).map(([name, value]) => ({ name, value: String(value) }));\n  }\n  const scope = input.scope || 'n8n-email';\n  return { ok: true, payload, idempotencyKey: idempotencyKey(input.event_id, scope), to: to.map(normalise) };\n}\n\nfunction getHeader(headers, name) {\n  const lower = {};\n  for (const [k, v] of Object.entries(headers || {})) lower[k.toLowerCase()] = v;\n  return lower[`svix-${name}`] || lower[`webhook-${name}`];\n}\n\n// Svix verification, as documented for Resend webhooks.\n// rawBody must be the exact bytes received (a Buffer or a string).\nfunction verifySvix(rawBody, headers, secret, nowSeconds) {\n  const fail = (reason) => ({ valid: false, reason });\n  const id = getHeader(headers, 'id');\n  const ts = getHeader(headers, 'timestamp');\n  const sigs = getHeader(headers, 'signature');\n  if (!id || !ts || !sigs) return fail('missing svix headers');\n  if (!/^\\d+$/.test(String(ts))) return fail('bad timestamp');\n  const now = nowSeconds === undefined ? Math.floor(Date.now() / 1000) : nowSeconds;\n  if (Math.abs(now - Number(ts)) > TOLERANCE_SECONDS) return fail('timestamp outside the allowed window');\n  if (!secret) return fail('webhook secret is not configured');\n  const secretBytes = Buffer.from(secret.startsWith('whsec_') ? secret.slice(6) : secret, 'base64');\n  const body = Buffer.isBuffer(rawBody) ? rawBody : Buffer.from(String(rawBody), 'utf8');\n  const signed = Buffer.concat([Buffer.from(`${id}.${ts}.`, 'utf8'), body]);\n  const expected = Buffer.from(crypto.createHmac('sha256', secretBytes).update(signed).digest('base64'));\n  let matched = false;\n  for (const entry of String(sigs).split(' ')) {\n    const comma = entry.indexOf(',');\n    if (comma === -1 || entry.slice(0, comma) !== 'v1') continue;\n    const given = Buffer.from(entry.slice(comma + 1));\n    if (given.length === expected.length && crypto.timingSafeEqual(given, expected)) {\n      matched = true;\n      break;\n    }\n  }\n  if (!matched) return fail('no matching signature');\n  let event;\n  try {\n    event = JSON.parse(body.toString('utf8'));\n  } catch (e) {\n    return fail('body is not valid JSON');\n  }\n  return { valid: true, svixId: id, event };\n}\n\nfunction suppressionReason(event) {\n  const reason = SUPPRESS_ON[event && event.type];\n  if (!reason) return null;\n  if (event.type === 'email.bounced') {\n    const bounce = (event.data && event.data.bounce) || {};\n    if (String(bounce.type || '').toLowerCase() === 'transient') return null;\n  }\n  return reason;\n}\n\n// Apply a verified event to a store shaped like n8n static data:\n// { suppressed: { email: {reason, svixId, at} }, seen: [svixId, ...] }\nfunction applyEvent(store, svixId, event, nowIso) {\n  store.suppressed = store.suppressed || {};\n  store.seen = store.seen || [];\n  if (store.seen.includes(svixId)) return { type: event.type, duplicate: true, suppressed: [] };\n  store.seen.push(svixId);\n  if (store.seen.length > 1000) store.seen.splice(0, store.seen.length - 1000);\n  const added = [];\n  const reason = suppressionReason(event);\n  if (reason) {\n    const to = (event.data && event.data.to) || [];\n    for (const addr of Array.isArray(to) ? to : [to]) {\n      const key = normalise(addr);\n      if (key && !store.suppressed[key]) {\n        store.suppressed[key] = { reason, svixId, at: nowIso || new Date().toISOString() };\n        added.push(key);\n      }\n    }\n  }\n  return { type: event.type, duplicate: false, suppressed: added };\n}\n\nif (typeof module !== 'undefined') {\n  module.exports = { idempotencyKey, normalise, buildEmail, verifySvix, suppressionReason, applyEvent };\n}\n\n// ---- n8n glue ----\nconst store = $getWorkflowStaticData('global');\nreturn { json: applyEvent(store, $json.svixId, $json.event) };\n"
+      },
+      "name": "Record event and suppress",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        660,
+        -100
+      ],
+      "id": "n-record-event-and-suppress"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { ok: true, ...$json } }}",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "name": "200 OK",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        880,
+        -100
+      ],
+      "id": "n-200-ok"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { ok: false, error: 'invalid signature' } }}",
+        "options": {
+          "responseCode": 400
+        }
+      },
+      "name": "400 invalid signature",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        660,
+        150
+      ],
+      "id": "n-400-invalid-signature"
+    },
+    {
+      "parameters": {
+        "httpMethod": "GET",
+        "path": "resend-suppression",
+        "authentication": "headerAuth",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "name": "Suppression lookup",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        400
+      ],
+      "id": "n-suppression-lookup",
+      "webhookId": "resend-suppression",
+      "credentials": {
+        "httpHeaderAuth": {
+          "name": "Notifier caller token"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "language": "javaScript",
+        "jsCode": "// Pure helpers shared by the n8n Code nodes. No n8n globals, no network.\n// The build script (scripts/build_n8n.py) pastes this file into each Code\n// node, followed by that node's glue code. The tests run it with Node.\n\nconst crypto = require('crypto');\n\nconst TOLERANCE_SECONDS = 5 * 60;\nconst SUPPRESS_ON = {\n  'email.bounced': 'bounced',\n  'email.complained': 'complained',\n  'email.suppressed': 'suppressed_by_resend',\n};\n\n// Same scheme as the Python package: \"<scope>/<sha256(scope \\x1f event_id)>\".\n// So the Python sender and the n8n sender agree on the key for one event.\nfunction idempotencyKey(eventId, scope) {\n  scope = scope || 'email';\n  if (eventId === undefined || eventId === null || !String(eventId).trim()) {\n    throw new Error('event_id is required for an idempotency key');\n  }\n  const digest = crypto.createHash('sha256').update(`${scope}\\x1f${eventId}`, 'utf8').digest('hex');\n  const safeScope = scope.replace(/[^A-Za-z0-9_.-]+/g, '-').slice(0, 64) || 'email';\n  return `${safeScope}/${digest}`;\n}\n\nfunction normalise(address) {\n  let a = String(address || '').trim();\n  const lt = a.lastIndexOf('<');\n  if (lt !== -1 && a.endsWith('>')) a = a.slice(lt + 1, -1);\n  return a.trim().toLowerCase();\n}\n\n// Validate an incoming send request and build the Resend payload.\nfunction buildEmail(input, defaults) {\n  const errors = [];\n  const to = Array.isArray(input.to) ? input.to : input.to ? [input.to] : [];\n  if (!input.event_id) errors.push('event_id is required');\n  if (!to.length) errors.push('to is required');\n  if (to.length > 50) errors.push('to has more than 50 recipients');\n  if (!input.subject) errors.push('subject is required');\n  if (!input.html && !input.text) errors.push('html or text is required');\n  const from = input.from || defaults.from;\n  if (!from) errors.push('from is required (set it in Config)');\n  if (errors.length) return { ok: false, errors };\n  const payload = {\n    from,\n    to,\n    subject: String(input.subject).replace(/\\s+/g, ' ').trim(),\n  };\n  if (input.html) payload.html = input.html;\n  if (input.text) payload.text = input.text;\n  if (input.reply_to || defaults.reply_to) payload.reply_to = input.reply_to || defaults.reply_to;\n  if (input.tags && typeof input.tags === 'object') {\n    payload.tags = Object.entries(input.tags).map(([name, value]) => ({ name, value: String(value) }));\n  }\n  const scope = input.scope || 'n8n-email';\n  return { ok: true, payload, idempotencyKey: idempotencyKey(input.event_id, scope), to: to.map(normalise) };\n}\n\nfunction getHeader(headers, name) {\n  const lower = {};\n  for (const [k, v] of Object.entries(headers || {})) lower[k.toLowerCase()] = v;\n  return lower[`svix-${name}`] || lower[`webhook-${name}`];\n}\n\n// Svix verification, as documented for Resend webhooks.\n// rawBody must be the exact bytes received (a Buffer or a string).\nfunction verifySvix(rawBody, headers, secret, nowSeconds) {\n  const fail = (reason) => ({ valid: false, reason });\n  const id = getHeader(headers, 'id');\n  const ts = getHeader(headers, 'timestamp');\n  const sigs = getHeader(headers, 'signature');\n  if (!id || !ts || !sigs) return fail('missing svix headers');\n  if (!/^\\d+$/.test(String(ts))) return fail('bad timestamp');\n  const now = nowSeconds === undefined ? Math.floor(Date.now() / 1000) : nowSeconds;\n  if (Math.abs(now - Number(ts)) > TOLERANCE_SECONDS) return fail('timestamp outside the allowed window');\n  if (!secret) return fail('webhook secret is not configured');\n  const secretBytes = Buffer.from(secret.startsWith('whsec_') ? secret.slice(6) : secret, 'base64');\n  const body = Buffer.isBuffer(rawBody) ? rawBody : Buffer.from(String(rawBody), 'utf8');\n  const signed = Buffer.concat([Buffer.from(`${id}.${ts}.`, 'utf8'), body]);\n  const expected = Buffer.from(crypto.createHmac('sha256', secretBytes).update(signed).digest('base64'));\n  let matched = false;\n  for (const entry of String(sigs).split(' ')) {\n    const comma = entry.indexOf(',');\n    if (comma === -1 || entry.slice(0, comma) !== 'v1') continue;\n    const given = Buffer.from(entry.slice(comma + 1));\n    if (given.length === expected.length && crypto.timingSafeEqual(given, expected)) {\n      matched = true;\n      break;\n    }\n  }\n  if (!matched) return fail('no matching signature');\n  let event;\n  try {\n    event = JSON.parse(body.toString('utf8'));\n  } catch (e) {\n    return fail('body is not valid JSON');\n  }\n  return { valid: true, svixId: id, event };\n}\n\nfunction suppressionReason(event) {\n  const reason = SUPPRESS_ON[event && event.type];\n  if (!reason) return null;\n  if (event.type === 'email.bounced') {\n    const bounce = (event.data && event.data.bounce) || {};\n    if (String(bounce.type || '').toLowerCase() === 'transient') return null;\n  }\n  return reason;\n}\n\n// Apply a verified event to a store shaped like n8n static data:\n// { suppressed: { email: {reason, svixId, at} }, seen: [svixId, ...] }\nfunction applyEvent(store, svixId, event, nowIso) {\n  store.suppressed = store.suppressed || {};\n  store.seen = store.seen || [];\n  if (store.seen.includes(svixId)) return { type: event.type, duplicate: true, suppressed: [] };\n  store.seen.push(svixId);\n  if (store.seen.length > 1000) store.seen.splice(0, store.seen.length - 1000);\n  const added = [];\n  const reason = suppressionReason(event);\n  if (reason) {\n    const to = (event.data && event.data.to) || [];\n    for (const addr of Array.isArray(to) ? to : [to]) {\n      const key = normalise(addr);\n      if (key && !store.suppressed[key]) {\n        store.suppressed[key] = { reason, svixId, at: nowIso || new Date().toISOString() };\n        added.push(key);\n      }\n    }\n  }\n  return { type: event.type, duplicate: false, suppressed: added };\n}\n\nif (typeof module !== 'undefined') {\n  module.exports = { idempotencyKey, normalise, buildEmail, verifySvix, suppressionReason, applyEvent };\n}\n\n// ---- n8n glue ----\nconst store = $getWorkflowStaticData('global');\nconst asked = String(($json.query || {}).email || '').split(',').map(normalise).filter(Boolean);\nconst suppressed = asked.filter((a) => store.suppressed && store.suppressed[a]);\nreturn { json: { checked: asked.length, suppressed } };\n"
+      },
+      "name": "Look up addresses",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        220,
+        400
+      ],
+      "id": "n-look-up-addresses"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ $json }}",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "name": "Lookup result",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        440,
+        400
+      ],
+      "id": "n-lookup-result"
+    }
+  ],
+  "connections": {
+    "Resend events": {
+      "main": [
+        [
+          {
+            "node": "Verify Svix signature",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Verify Svix signature": {
+      "main": [
+        [
+          {
+            "node": "Signature valid?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Signature valid?": {
+      "main": [
+        [
+          {
+            "node": "Record event and suppress",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "400 invalid signature",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Record event and suppress": {
+      "main": [
+        [
+          {
+            "node": "200 OK",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Suppression lookup": {
+      "main": [
+        [
+          {
+            "node": "Look up addresses",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Look up addresses": {
+      "main": [
+        [
+          {
+            "node": "Lookup result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner",
+    "errorWorkflow": ""
+  },
+  "pinData": {},
+  "meta": {
+    "templateCredsSetupCompleted": false
+  },
+  "tags": []
+}

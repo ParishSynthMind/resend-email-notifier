@@ -1,0 +1,12 @@
+Thanks for your order, {{ customer_name }}
+
+Order {{ order_number }} is confirmed. Here is what you ordered:
+{% for item in items %}
+- {{ item.qty }} x {{ item.name }}: {{ currency }}{{ "%.2f"|format(item.price) }}
+{%- endfor %}
+
+Total: {{ currency }}{{ "%.2f"|format(total) }}
+{% if note %}
+Your note: {{ note }}
+{% endif %}
+We will email you again when it ships.

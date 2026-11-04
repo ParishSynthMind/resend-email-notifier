@@ -1,0 +1,8 @@
+[
+  {"event_id": "reset-77", "template": "password_reset", "to": "alex@example.com",
+   "context": {"name": "Alex", "app_name": "Acme Portal", "expires_minutes": 30,
+               "reset_url": "https://portal.example.com/reset?token=demo-token-1"}},
+  {"event_id": "reset-78", "template": "password_reset", "to": "jo@example.com",
+   "context": {"name": "Jo", "app_name": "Acme Portal", "expires_minutes": 30,
+               "reset_url": "https://portal.example.com/reset?token=demo-token-2"}}
+]

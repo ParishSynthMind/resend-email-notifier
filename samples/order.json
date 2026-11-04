@@ -1,0 +1,11 @@
+{
+  "customer_name": "Sam Rivera",
+  "order_number": "A-1001",
+  "currency": "$",
+  "items": [
+    {"name": "Ceramic mug", "qty": 2, "price": 24.00},
+    {"name": "Pour-over filter papers", "qty": 1, "price": 6.50}
+  ],
+  "total": 54.50,
+  "note": "Please gift wrap <the mugs> & add a card"
+}

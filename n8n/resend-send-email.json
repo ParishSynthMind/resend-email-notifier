@@ -1,0 +1,434 @@
+{
+  "name": "Resend: send transactional email",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "send-email",
+        "authentication": "headerAuth",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "name": "Send request",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        0
+      ],
+      "id": "n-send-request",
+      "webhookId": "send-email",
+      "credentials": {
+        "httpHeaderAuth": {
+          "name": "Notifier caller token"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "cfg-1",
+              "name": "from",
+              "value": "Your App <notifications@yourdomain.example>",
+              "type": "string"
+            },
+            {
+              "id": "cfg-2",
+              "name": "reply_to",
+              "value": "",
+              "type": "string"
+            },
+            {
+              "id": "cfg-3",
+              "name": "suppression_lookup_url",
+              "value": "https://your-n8n.example.com/webhook/resend-suppression",
+              "type": "string"
+            },
+            {
+              "id": "cfg-4",
+              "name": "resend_api_url",
+              "value": "https://api.resend.com/emails",
+              "type": "string"
+            }
+          ]
+        },
+        "includeOtherFields": true,
+        "options": {}
+      },
+      "name": "Config",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        220,
+        0
+      ],
+      "id": "n-config"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "language": "javaScript",
+        "jsCode": "// Pure helpers shared by the n8n Code nodes. No n8n globals, no network.\n// The build script (scripts/build_n8n.py) pastes this file into each Code\n// node, followed by that node's glue code. The tests run it with Node.\n\nconst crypto = require('crypto');\n\nconst TOLERANCE_SECONDS = 5 * 60;\nconst SUPPRESS_ON = {\n  'email.bounced': 'bounced',\n  'email.complained': 'complained',\n  'email.suppressed': 'suppressed_by_resend',\n};\n\n// Same scheme as the Python package: \"<scope>/<sha256(scope \\x1f event_id)>\".\n// So the Python sender and the n8n sender agree on the key for one event.\nfunction idempotencyKey(eventId, scope) {\n  scope = scope || 'email';\n  if (eventId === undefined || eventId === null || !String(eventId).trim()) {\n    throw new Error('event_id is required for an idempotency key');\n  }\n  const digest = crypto.createHash('sha256').update(`${scope}\\x1f${eventId}`, 'utf8').digest('hex');\n  const safeScope = scope.replace(/[^A-Za-z0-9_.-]+/g, '-').slice(0, 64) || 'email';\n  return `${safeScope}/${digest}`;\n}\n\nfunction normalise(address) {\n  let a = String(address || '').trim();\n  const lt = a.lastIndexOf('<');\n  if (lt !== -1 && a.endsWith('>')) a = a.slice(lt + 1, -1);\n  return a.trim().toLowerCase();\n}\n\n// Validate an incoming send request and build the Resend payload.\nfunction buildEmail(input, defaults) {\n  const errors = [];\n  const to = Array.isArray(input.to) ? input.to : input.to ? [input.to] : [];\n  if (!input.event_id) errors.push('event_id is required');\n  if (!to.length) errors.push('to is required');\n  if (to.length > 50) errors.push('to has more than 50 recipients');\n  if (!input.subject) errors.push('subject is required');\n  if (!input.html && !input.text) errors.push('html or text is required');\n  const from = input.from || defaults.from;\n  if (!from) errors.push('from is required (set it in Config)');\n  if (errors.length) return { ok: false, errors };\n  const payload = {\n    from,\n    to,\n    subject: String(input.subject).replace(/\\s+/g, ' ').trim(),\n  };\n  if (input.html) payload.html = input.html;\n  if (input.text) payload.text = input.text;\n  if (input.reply_to || defaults.reply_to) payload.reply_to = input.reply_to || defaults.reply_to;\n  if (input.tags && typeof input.tags === 'object') {\n    payload.tags = Object.entries(input.tags).map(([name, value]) => ({ name, value: String(value) }));\n  }\n  const scope = input.scope || 'n8n-email';\n  return { ok: true, payload, idempotencyKey: idempotencyKey(input.event_id, scope), to: to.map(normalise) };\n}\n\nfunction getHeader(headers, name) {\n  const lower = {};\n  for (const [k, v] of Object.entries(headers || {})) lower[k.toLowerCase()] = v;\n  return lower[`svix-${name}`] || lower[`webhook-${name}`];\n}\n\n// Svix verification, as documented for Resend webhooks.\n// rawBody must be the exact bytes received (a Buffer or a string).\nfunction verifySvix(rawBody, headers, secret, nowSeconds) {\n  const fail = (reason) => ({ valid: false, reason });\n  const id = getHeader(headers, 'id');\n  const ts = getHeader(headers, 'timestamp');\n  const sigs = getHeader(headers, 'signature');\n  if (!id || !ts || !sigs) return fail('missing svix headers');\n  if (!/^\\d+$/.test(String(ts))) return fail('bad timestamp');\n  const now = nowSeconds === undefined ? Math.floor(Date.now() / 1000) : nowSeconds;\n  if (Math.abs(now - Number(ts)) > TOLERANCE_SECONDS) return fail('timestamp outside the allowed window');\n  if (!secret) return fail('webhook secret is not configured');\n  const secretBytes = Buffer.from(secret.startsWith('whsec_') ? secret.slice(6) : secret, 'base64');\n  const body = Buffer.isBuffer(rawBody) ? rawBody : Buffer.from(String(rawBody), 'utf8');\n  const signed = Buffer.concat([Buffer.from(`${id}.${ts}.`, 'utf8'), body]);\n  const expected = Buffer.from(crypto.createHmac('sha256', secretBytes).update(signed).digest('base64'));\n  let matched = false;\n  for (const entry of String(sigs).split(' ')) {\n    const comma = entry.indexOf(',');\n    if (comma === -1 || entry.slice(0, comma) !== 'v1') continue;\n    const given = Buffer.from(entry.slice(comma + 1));\n    if (given.length === expected.length && crypto.timingSafeEqual(given, expected)) {\n      matched = true;\n      break;\n    }\n  }\n  if (!matched) return fail('no matching signature');\n  let event;\n  try {\n    event = JSON.parse(body.toString('utf8'));\n  } catch (e) {\n    return fail('body is not valid JSON');\n  }\n  return { valid: true, svixId: id, event };\n}\n\nfunction suppressionReason(event) {\n  const reason = SUPPRESS_ON[event && event.type];\n  if (!reason) return null;\n  if (event.type === 'email.bounced') {\n    const bounce = (event.data && event.data.bounce) || {};\n    if (String(bounce.type || '').toLowerCase() === 'transient') return null;\n  }\n  return reason;\n}\n\n// Apply a verified event to a store shaped like n8n static data:\n// { suppressed: { email: {reason, svixId, at} }, seen: [svixId, ...] }\nfunction applyEvent(store, svixId, event, nowIso) {\n  store.suppressed = store.suppressed || {};\n  store.seen = store.seen || [];\n  if (store.seen.includes(svixId)) return { type: event.type, duplicate: true, suppressed: [] };\n  store.seen.push(svixId);\n  if (store.seen.length > 1000) store.seen.splice(0, store.seen.length - 1000);\n  const added = [];\n  const reason = suppressionReason(event);\n  if (reason) {\n    const to = (event.data && event.data.to) || [];\n    for (const addr of Array.isArray(to) ? to : [to]) {\n      const key = normalise(addr);\n      if (key && !store.suppressed[key]) {\n        store.suppressed[key] = { reason, svixId, at: nowIso || new Date().toISOString() };\n        added.push(key);\n      }\n    }\n  }\n  return { type: event.type, duplicate: false, suppressed: added };\n}\n\nif (typeof module !== 'undefined') {\n  module.exports = { idempotencyKey, normalise, buildEmail, verifySvix, suppressionReason, applyEvent };\n}\n\n// ---- n8n glue ----\nconst cfg = $('Config').item.json;\nconst result = buildEmail($('Send request').item.json.body || {}, { from: cfg.from, reply_to: cfg.reply_to });\nreturn { json: result };\n"
+      },
+      "name": "Build email and idempotency key",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        440,
+        0
+      ],
+      "id": "n-build-email-and-idempotency-key"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "id": "c1",
+              "leftValue": "={{ $json.ok }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "name": "Input valid?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        660,
+        0
+      ],
+      "id": "n-input-valid?"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { ok: false, errors: $json.errors } }}",
+        "options": {
+          "responseCode": 422
+        }
+      },
+      "name": "422 invalid input",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        880,
+        200
+      ],
+      "id": "n-422-invalid-input"
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $('Config').item.json.suppression_lookup_url }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "email",
+              "value": "={{ $json.to.join(',') }}"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 10000
+        }
+      },
+      "name": "Check suppression list",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        880,
+        -100
+      ],
+      "id": "n-check-suppression-list",
+      "credentials": {
+        "httpHeaderAuth": {
+          "name": "Notifier caller token"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 1000,
+      "onError": "continueRegularOutput",
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "language": "javaScript",
+        "jsCode": "// Pure helpers shared by the n8n Code nodes. No n8n globals, no network.\n// The build script (scripts/build_n8n.py) pastes this file into each Code\n// node, followed by that node's glue code. The tests run it with Node.\n\nconst crypto = require('crypto');\n\nconst TOLERANCE_SECONDS = 5 * 60;\nconst SUPPRESS_ON = {\n  'email.bounced': 'bounced',\n  'email.complained': 'complained',\n  'email.suppressed': 'suppressed_by_resend',\n};\n\n// Same scheme as the Python package: \"<scope>/<sha256(scope \\x1f event_id)>\".\n// So the Python sender and the n8n sender agree on the key for one event.\nfunction idempotencyKey(eventId, scope) {\n  scope = scope || 'email';\n  if (eventId === undefined || eventId === null || !String(eventId).trim()) {\n    throw new Error('event_id is required for an idempotency key');\n  }\n  const digest = crypto.createHash('sha256').update(`${scope}\\x1f${eventId}`, 'utf8').digest('hex');\n  const safeScope = scope.replace(/[^A-Za-z0-9_.-]+/g, '-').slice(0, 64) || 'email';\n  return `${safeScope}/${digest}`;\n}\n\nfunction normalise(address) {\n  let a = String(address || '').trim();\n  const lt = a.lastIndexOf('<');\n  if (lt !== -1 && a.endsWith('>')) a = a.slice(lt + 1, -1);\n  return a.trim().toLowerCase();\n}\n\n// Validate an incoming send request and build the Resend payload.\nfunction buildEmail(input, defaults) {\n  const errors = [];\n  const to = Array.isArray(input.to) ? input.to : input.to ? [input.to] : [];\n  if (!input.event_id) errors.push('event_id is required');\n  if (!to.length) errors.push('to is required');\n  if (to.length > 50) errors.push('to has more than 50 recipients');\n  if (!input.subject) errors.push('subject is required');\n  if (!input.html && !input.text) errors.push('html or text is required');\n  const from = input.from || defaults.from;\n  if (!from) errors.push('from is required (set it in Config)');\n  if (errors.length) return { ok: false, errors };\n  const payload = {\n    from,\n    to,\n    subject: String(input.subject).replace(/\\s+/g, ' ').trim(),\n  };\n  if (input.html) payload.html = input.html;\n  if (input.text) payload.text = input.text;\n  if (input.reply_to || defaults.reply_to) payload.reply_to = input.reply_to || defaults.reply_to;\n  if (input.tags && typeof input.tags === 'object') {\n    payload.tags = Object.entries(input.tags).map(([name, value]) => ({ name, value: String(value) }));\n  }\n  const scope = input.scope || 'n8n-email';\n  return { ok: true, payload, idempotencyKey: idempotencyKey(input.event_id, scope), to: to.map(normalise) };\n}\n\nfunction getHeader(headers, name) {\n  const lower = {};\n  for (const [k, v] of Object.entries(headers || {})) lower[k.toLowerCase()] = v;\n  return lower[`svix-${name}`] || lower[`webhook-${name}`];\n}\n\n// Svix verification, as documented for Resend webhooks.\n// rawBody must be the exact bytes received (a Buffer or a string).\nfunction verifySvix(rawBody, headers, secret, nowSeconds) {\n  const fail = (reason) => ({ valid: false, reason });\n  const id = getHeader(headers, 'id');\n  const ts = getHeader(headers, 'timestamp');\n  const sigs = getHeader(headers, 'signature');\n  if (!id || !ts || !sigs) return fail('missing svix headers');\n  if (!/^\\d+$/.test(String(ts))) return fail('bad timestamp');\n  const now = nowSeconds === undefined ? Math.floor(Date.now() / 1000) : nowSeconds;\n  if (Math.abs(now - Number(ts)) > TOLERANCE_SECONDS) return fail('timestamp outside the allowed window');\n  if (!secret) return fail('webhook secret is not configured');\n  const secretBytes = Buffer.from(secret.startsWith('whsec_') ? secret.slice(6) : secret, 'base64');\n  const body = Buffer.isBuffer(rawBody) ? rawBody : Buffer.from(String(rawBody), 'utf8');\n  const signed = Buffer.concat([Buffer.from(`${id}.${ts}.`, 'utf8'), body]);\n  const expected = Buffer.from(crypto.createHmac('sha256', secretBytes).update(signed).digest('base64'));\n  let matched = false;\n  for (const entry of String(sigs).split(' ')) {\n    const comma = entry.indexOf(',');\n    if (comma === -1 || entry.slice(0, comma) !== 'v1') continue;\n    const given = Buffer.from(entry.slice(comma + 1));\n    if (given.length === expected.length && crypto.timingSafeEqual(given, expected)) {\n      matched = true;\n      break;\n    }\n  }\n  if (!matched) return fail('no matching signature');\n  let event;\n  try {\n    event = JSON.parse(body.toString('utf8'));\n  } catch (e) {\n    return fail('body is not valid JSON');\n  }\n  return { valid: true, svixId: id, event };\n}\n\nfunction suppressionReason(event) {\n  const reason = SUPPRESS_ON[event && event.type];\n  if (!reason) return null;\n  if (event.type === 'email.bounced') {\n    const bounce = (event.data && event.data.bounce) || {};\n    if (String(bounce.type || '').toLowerCase() === 'transient') return null;\n  }\n  return reason;\n}\n\n// Apply a verified event to a store shaped like n8n static data:\n// { suppressed: { email: {reason, svixId, at} }, seen: [svixId, ...] }\nfunction applyEvent(store, svixId, event, nowIso) {\n  store.suppressed = store.suppressed || {};\n  store.seen = store.seen || [];\n  if (store.seen.includes(svixId)) return { type: event.type, duplicate: true, suppressed: [] };\n  store.seen.push(svixId);\n  if (store.seen.length > 1000) store.seen.splice(0, store.seen.length - 1000);\n  const added = [];\n  const reason = suppressionReason(event);\n  if (reason) {\n    const to = (event.data && event.data.to) || [];\n    for (const addr of Array.isArray(to) ? to : [to]) {\n      const key = normalise(addr);\n      if (key && !store.suppressed[key]) {\n        store.suppressed[key] = { reason, svixId, at: nowIso || new Date().toISOString() };\n        added.push(key);\n      }\n    }\n  }\n  return { type: event.type, duplicate: false, suppressed: added };\n}\n\nif (typeof module !== 'undefined') {\n  module.exports = { idempotencyKey, normalise, buildEmail, verifySvix, suppressionReason, applyEvent };\n}\n\n// ---- n8n glue ----\nconst built = $('Build email and idempotency key').item.json;\nconst lookup = $json || {};\n// If the lookup failed we still send (transactional mail such as password\n// resets matters more), but say so in the result. Resend also keeps its own\n// account-level suppression list, which stays in force either way.\nconst suppressed = Array.isArray(lookup.suppressed) ? lookup.suppressed.map(normalise) : [];\nconst lookupOk = Array.isArray(lookup.suppressed);\nconst keep = built.payload.to.filter((addr) => !suppressed.includes(normalise(addr)));\nreturn { json: { ...built, payload: { ...built.payload, to: keep }, skipped: suppressed,\n                 suppressionLookupOk: lookupOk, allSuppressed: keep.length === 0 } };\n"
+      },
+      "name": "Drop suppressed recipients",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1100,
+        -100
+      ],
+      "id": "n-drop-suppressed-recipients"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "id": "c1",
+              "leftValue": "={{ $json.allSuppressed }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "name": "All suppressed?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1320,
+        -100
+      ],
+      "id": "n-all-suppressed?"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { ok: true, status: 'suppressed', skipped: $json.skipped } }}",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "name": "200 suppressed",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        1540,
+        -250
+      ],
+      "id": "n-200-suppressed"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $('Config').item.json.resend_api_url }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Idempotency-Key",
+              "value": "={{ $json.idempotencyKey }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.payload) }}",
+        "options": {
+          "timeout": 15000
+        }
+      },
+      "name": "Resend: send email",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1540,
+        0
+      ],
+      "id": "n-resend-send-email",
+      "credentials": {
+        "httpHeaderAuth": {
+          "name": "Resend API key"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 4,
+      "waitBetweenTries": 2000,
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { ok: true, status: 'sent', id: $json.id, idempotency_key: $('Drop suppressed recipients').item.json.idempotencyKey, skipped: $('Drop suppressed recipients').item.json.skipped } }}",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "name": "200 sent",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        1760,
+        -50
+      ],
+      "id": "n-200-sent"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { ok: false, status: 'failed', error: $json.error } }}",
+        "options": {
+          "responseCode": 502
+        }
+      },
+      "name": "502 send failed",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        1760,
+        150
+      ],
+      "id": "n-502-send-failed"
+    }
+  ],
+  "connections": {
+    "Send request": {
+      "main": [
+        [
+          {
+            "node": "Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Config": {
+      "main": [
+        [
+          {
+            "node": "Build email and idempotency key",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build email and idempotency key": {
+      "main": [
+        [
+          {
+            "node": "Input valid?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Input valid?": {
+      "main": [
+        [
+          {
+            "node": "Check suppression list",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "422 invalid input",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check suppression list": {
+      "main": [
+        [
+          {
+            "node": "Drop suppressed recipients",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Drop suppressed recipients": {
+      "main": [
+        [
+          {
+            "node": "All suppressed?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "All suppressed?": {
+      "main": [
+        [
+          {
+            "node": "200 suppressed",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Resend: send email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Resend: send email": {
+      "main": [
+        [
+          {
+            "node": "200 sent",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "502 send failed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner",
+    "errorWorkflow": ""
+  },
+  "pinData": {},
+  "meta": {
+    "templateCredsSetupCompleted": false
+  },
+  "tags": []
+}

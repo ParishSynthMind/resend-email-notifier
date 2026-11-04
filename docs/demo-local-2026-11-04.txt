@@ -1,0 +1,48 @@
+
+== 1. Send order confirmation (fake API answers 429 Retry-After:1, then 503, then OK)
+WARNING resend_notifier.client resend /emails attempt=1 status=429 error=rate_limit_exceeded ms=4
+INFO resend_notifier.client resend /emails retrying in 1.00s
+WARNING resend_notifier.client resend /emails attempt=2 status=503 error=service_unavailable ms=5
+INFO resend_notifier.client resend /emails retrying in 0.84s
+INFO resend_notifier.client resend /emails attempt=3 status=200 ms=6 idempotency_key=order_confirmation/c1e9e39f318b827a3ddf52a6667cecf6c6584c3f8f060c22c6c3fff756de4635
+INFO resend_notifier.notifier event=order-A-1001 template=order_confirmation sent email_id=f9d3f674-8470-45a7-b0d0-e7cac35a8a35
+{"status": "sent", "event_id": "order-A-1001", "idempotency_key": "order_confirmation/c1e9e39f318b827a3ddf52a6667cecf6c6584c3f8f060c22c6c3fff756de4635", "email_id": "f9d3f674-8470-45a7-b0d0-e7cac35a8a35", "skipped": []}
+
+== 2. Same event sent again (job re-run): same Idempotency-Key, no second email
+{"status": "sent", "event_id": "order-A-1001", "idempotency_key": "order_confirmation/c1e9e39f318b827a3ddf52a6667cecf6c6584c3f8f060c22c6c3fff756de4635", "email_id": "f9d3f674-8470-45a7-b0d0-e7cac35a8a35", "skipped": []}
+
+== 3. Correctly signed email.bounced webhook for bounce-me@example.com
+{"ok": true, "type": "email.bounced", "duplicate": false, "suppressed": ["bounce-me@example.com"]}  -> HTTP 200
+
+== 4. Tampered body (recipient changed after signing)
+{"ok": false, "error": "invalid signature"}  -> HTTP 400
+
+== 5. Signed with the wrong secret
+{"ok": false, "error": "invalid signature"}  -> HTTP 400
+
+== 6. Correct signature but timestamp 10 minutes old (replay)
+{"ok": false, "error": "invalid signature"}  -> HTTP 400
+
+== 7. Try to email the bounced address: skipped, no API call
+{"status": "suppressed", "event_id": "order-A-1002", "idempotency_key": null, "email_id": null, "skipped": ["bounce-me@example.com"]}
+
+== 8. Batch send (2 password resets in one POST /emails/batch)
+{"status": "sent", "event_id": "reset-77", "idempotency_key": "batch/01e74bae3ed319c241f62d46e07af54fcb7d6d91f2921f9d49c06a83424f784a", "email_id": "630b6476-3a0d-4e6e-9e41-9aebb8e28ed2", "skipped": []}
+{"status": "sent", "event_id": "reset-78", "idempotency_key": "batch/01e74bae3ed319c241f62d46e07af54fcb7d6d91f2921f9d49c06a83424f784a", "email_id": "b91e9f67-2668-4f8e-95a5-cb7f8264e915", "skipped": []}
+
+== Suppression list
+{"email": "bounce-me@example.com", "reason": "bounced", "source_event_id": "msg_cfcd0c8258054cfe88ca5500", "created_at": 1793784165.1646452}
+
+== What the fake Resend API received
+{"n": 1, "path": "/emails", "idempotency_key": "order_confirmation/c1e9e39f318b827a3ddf52a6667cecf6c6584c3f8f060c22c6c3fff756de4635", "has_bearer": true, "status": 429}
+{"n": 2, "path": "/emails", "idempotency_key": "order_confirmation/c1e9e39f318b827a3ddf52a6667cecf6c6584c3f8f060c22c6c3fff756de4635", "has_bearer": true, "status": 503}
+{"n": 3, "path": "/emails", "idempotency_key": "order_confirmation/c1e9e39f318b827a3ddf52a6667cecf6c6584c3f8f060c22c6c3fff756de4635", "has_bearer": true, "to": [["sam@example.com"]], "subjects": ["Order A-1001 confirmed, thanks Sam Rivera"], "status": 200}
+{"n": 4, "path": "/emails", "idempotency_key": "order_confirmation/c1e9e39f318b827a3ddf52a6667cecf6c6584c3f8f060c22c6c3fff756de4635", "has_bearer": true, "replayed": true, "status": 200}
+{"n": 5, "path": "/emails/batch", "idempotency_key": "batch/01e74bae3ed319c241f62d46e07af54fcb7d6d91f2921f9d49c06a83424f784a", "has_bearer": true, "to": [["alex@example.com"], ["jo@example.com"]], "subjects": ["Reset your Acme Portal password", "Reset your Acme Portal password"], "status": 200}
+
+== Webhook receiver log
+INFO resend_notifier.server listening on http://127.0.0.1:8847/webhooks/resend
+INFO resend_notifier.webhook webhook msg_cfcd0c8258054cfe88ca5500 type=email.bounced suppressed=1
+WARNING resend_notifier.server rejected webhook from 127.0.0.1: no matching signature
+WARNING resend_notifier.server rejected webhook from 127.0.0.1: no matching signature
+WARNING resend_notifier.server rejected webhook from 127.0.0.1: timestamp outside the allowed window

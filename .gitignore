@@ -1,0 +1,11 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+PORTFOLIO-LISTING.md
+PROGRESS.md
+*.db
+*.jsonl
+.ruff_cache/
+suppressions.db

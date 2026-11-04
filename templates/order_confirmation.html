@@ -1,0 +1,21 @@
+<!doctype html>
+<html>
+  <body style="font-family: Arial, sans-serif; color: #1f2933; max-width: 560px; margin: 0 auto;">
+    <h1 style="font-size: 20px;">Thanks for your order, {{ customer_name }}</h1>
+    <p>Order <strong>{{ order_number }}</strong> is confirmed. Here is what you ordered:</p>
+    <table style="width: 100%; border-collapse: collapse;">
+      {% for item in items %}
+      <tr>
+        <td style="padding: 6px 0; border-bottom: 1px solid #e4e7eb;">{{ item.qty }} x {{ item.name }}</td>
+        <td style="padding: 6px 0; border-bottom: 1px solid #e4e7eb; text-align: right;">{{ currency }}{{ "%.2f"|format(item.price) }}</td>
+      </tr>
+      {% endfor %}
+      <tr>
+        <td style="padding: 6px 0;"><strong>Total</strong></td>
+        <td style="padding: 6px 0; text-align: right;"><strong>{{ currency }}{{ "%.2f"|format(total) }}</strong></td>
+      </tr>
+    </table>
+    {% if note %}<p>Your note: {{ note }}</p>{% endif %}
+    <p>We will email you again when it ships.</p>
+  </body>
+</html>
