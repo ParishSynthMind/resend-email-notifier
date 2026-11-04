@@ -8,3 +8,4 @@ select = ["E", "F", "W", "I", "B"]
 [lint.per-file-ignores]
 "scripts/build_n8n.py" = ["E501"]  # long n8n expressions
 "tests/test_n8n.py" = ["E501"]  # inline JavaScript run under Node
+"scripts/render_media.py" = ["E501"]  # inline HTML
